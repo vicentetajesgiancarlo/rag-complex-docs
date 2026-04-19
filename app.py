@@ -354,21 +354,28 @@ with st.sidebar:
             display_name = parts[1] if len(parts) > 1 else name
             st.markdown(f'<div class="paper-card">{display_name}</div>', unsafe_allow_html=True)
     else:
-        st.warning("No PDFs found. Run `python src/document_processor.py` first.")
+        st.markdown("""
+            <div style="font-size:0.78rem; color:#4a6fa5; line-height:1.7;
+                        background:#161b27; border:1px dashed #252d3d;
+                        border-radius:8px; padding:10px 12px;">
+                No documents yet.<br>Upload a PDF below to get started.
+            </div>
+        """, unsafe_allow_html=True)
 
     # LLM config
     st.markdown('<div class="sidebar-section-title">LLM Backend</div>', unsafe_allow_html=True)
     if not llm_available:
         st.markdown("""
             <div style="font-size:0.78rem; color:#8b9ab5; line-height:1.7;">
-                Enable answer generation:<br>
-                <b style="color:#c9d1e0;">OpenAI</b> — add <code>OPENAI_API_KEY</code> to <code>.env</code><br>
-                <b style="color:#c9d1e0;">Ollama</b> — run <code>ollama pull llama3</code>
+                Ollama is not running.<br>
+                Start it with:<br>
+                <code style="color:#c9d1e0;">ollama pull llama3</code><br>
+                <code style="color:#c9d1e0;">ollama serve</code>
             </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
-            <div style="font-size:0.78rem; color:#8b9ab5;">LLM is active and ready.</div>
+            <div style="font-size:0.78rem; color:#8b9ab5;">Ollama (llama3) is active and ready.</div>
         """, unsafe_allow_html=True)
 
     # PDF Upload
@@ -429,130 +436,133 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Main area — Hero
+# Main area — Hero / Empty state / Chat
 # ---------------------------------------------------------------------------
 
-if not st.session_state.messages:
-    st.markdown(f"""
+corpus_is_empty = live_pdf_count == 0
+
+if corpus_is_empty:
+    # ── Empty state: prompt user to upload ──────────────────────────────────
+    st.markdown("""
         <div class="hero">
             <h1>Academic Paper RAG</h1>
-            <p>Ask questions across indexed research papers. Answers are grounded in source documents.</p>
-        </div>
-        <div class="stats-bar">
-            <div class="stat-item">
-                <div class="stat-value">{live_pdf_count}</div>
-                <div class="stat-label">Papers</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">{live_chunk_count}</div>
-                <div class="stat-label">Chunks</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">512d</div>
-                <div class="stat-label">Embeddings</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">top&#8209;4</div>
-                <div class="stat-label">Retrieved</div>
-            </div>
+            <p>Upload your own PDF documents and ask questions about them.</p>
         </div>
     """, unsafe_allow_html=True)
 
-    # Example prompts
     st.markdown("""
-        <div style="text-align:center; margin-bottom:0.8rem;">
-            <span style="font-size:0.72rem; color:#4a6fa5; letter-spacing:0.1em; text-transform:uppercase;">
-                Try asking
-            </span>
+        <div style="max-width:480px; margin:0 auto 2rem; text-align:center;
+                    background:#161b27; border:1px dashed #3d6ad6;
+                    border-radius:16px; padding:2.5rem 2rem;">
+            <div style="font-size:2.5rem; margin-bottom:0.8rem;">📄</div>
+            <div style="font-size:1rem; font-weight:600; color:#e2e8f0;
+                        margin-bottom:0.5rem;">No documents indexed yet</div>
+            <div style="font-size:0.83rem; color:#64748b; line-height:1.6;">
+                Use the <b style="color:#3d6ad6;">Upload a PDF</b> panel in the
+                sidebar to add your first document.<br><br>
+                Once indexed, you can ask any question about its content
+                and the system will retrieve the most relevant passages
+                and generate a grounded answer.
+            </div>
         </div>
     """, unsafe_allow_html=True)
 
-    example_questions = [
-        "What is the Poincaré inequality?",
-        "What methods are used in PointTPA?",
-        "Explain the topology of minimal surfaces.",
-        "What evaluation metrics are used across the papers?",
-    ]
+    st.chat_input("Upload a PDF first to start chatting...", disabled=True)
 
-    cols = st.columns(2)
-    for i, q in enumerate(example_questions):
-        with cols[i % 2]:
-            if st.button(q, key=f"ex_{i}", use_container_width=True):
-                st.session_state.messages.append({"role": "user", "content": q})
-                st.rerun()
+else:
+    # ── Has documents: show stats bar + chat ────────────────────────────────
+    if not st.session_state.messages:
+        st.markdown(f"""
+            <div class="hero">
+                <h1>Academic Paper RAG</h1>
+                <p>Ask questions about your indexed documents. Answers are grounded in source text.</p>
+            </div>
+            <div class="stats-bar">
+                <div class="stat-item">
+                    <div class="stat-value">{live_pdf_count}</div>
+                    <div class="stat-label">Papers</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">{live_chunk_count}</div>
+                    <div class="stat-label">Chunks</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">512d</div>
+                    <div class="stat-label">Embeddings</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">top&#8209;4</div>
+                    <div class="stat-label">Retrieved</div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Chat history
-# ---------------------------------------------------------------------------
+    # Chat history
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"], unsafe_allow_html=True)
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"], unsafe_allow_html=True)
+    # Chat input & response
+    if prompt := st.chat_input("Ask a question about your documents..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-# ---------------------------------------------------------------------------
-# Chat input & response
-# ---------------------------------------------------------------------------
+        with st.chat_message("assistant"):
+            with st.spinner("Searching papers and generating answer..."):
+                sources = []
 
-if prompt := st.chat_input("Ask a question about the papers..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+                if llm_available and chain is not None:
+                    result = ask_question(prompt, chain=chain, retriever=retriever)
+                    answer = result["answer"]
+                    sources = result["sources"]
+                else:
+                    docs = retriever.invoke(prompt)
+                    answer_parts = [
+                        '<div style="font-size:0.8rem; color:#4a6fa5; '
+                        'text-transform:uppercase; letter-spacing:0.08em; '
+                        'margin-bottom:0.8rem;">Retrieved Context (no LLM)</div>'
+                    ]
+                    seen = set()
+                    for i, doc in enumerate(docs, 1):
+                        meta = doc.metadata
+                        source_file = Path(meta.get("source", "unknown")).name
+                        page = meta.get("page", "?")
+                        title = meta.get("title", source_file)
+                        answer_parts.append(
+                            f'<div style="background:#161b27; border:1px solid #1e2535; '
+                            f'border-radius:8px; padding:10px 14px; margin-bottom:8px; '
+                            f'font-size:0.83rem; color:#c9d1e0; line-height:1.6;">'
+                            f'<div style="font-size:0.7rem; color:#4a6fa5; margin-bottom:4px;">'
+                            f'{title} — p.{page}</div>'
+                            f'{doc.page_content[:400]}…</div>'
+                        )
+                        key = f"{source_file}:p{page}"
+                        if key not in seen:
+                            seen.add(key)
+                            sources.append({"title": title, "page": page, "file": source_file})
+                    answer = "\n".join(answer_parts)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching papers and generating answer..."):
-            sources = []
+                st.markdown(answer, unsafe_allow_html=True)
 
-            if llm_available and chain is not None:
-                result = ask_question(prompt, chain=chain, retriever=retriever)
-                answer = result["answer"]
-                sources = result["sources"]
-            else:
-                docs = retriever.invoke(prompt)
-                answer_parts = [
-                    '<div style="font-size:0.8rem; color:#4a6fa5; '
-                    'text-transform:uppercase; letter-spacing:0.08em; '
-                    'margin-bottom:0.8rem;">Retrieved Context (no LLM)</div>'
-                ]
-                seen = set()
-                for i, doc in enumerate(docs, 1):
-                    meta = doc.metadata
-                    source_file = Path(meta.get("source", "unknown")).name
-                    page = meta.get("page", "?")
-                    title = meta.get("title", source_file)
-                    answer_parts.append(
-                        f'<div style="background:#161b27; border:1px solid #1e2535; '
-                        f'border-radius:8px; padding:10px 14px; margin-bottom:8px; '
-                        f'font-size:0.83rem; color:#c9d1e0; line-height:1.6;">'
-                        f'<div style="font-size:0.7rem; color:#4a6fa5; margin-bottom:4px;">'
-                        f'{title} — p.{page}</div>'
-                        f'{doc.page_content[:400]}…</div>'
-                    )
-                    key = f"{source_file}:p{page}"
-                    if key not in seen:
-                        seen.add(key)
-                        sources.append({"title": title, "page": page, "file": source_file})
-                answer = "\n".join(answer_parts)
+                # Source pills
+                if sources:
+                    pills_html = '<div class="source-container"><div class="source-label">Sources</div>'
+                    for s in sources:
+                        pills_html += (
+                            f'<div class="source-pill">'
+                            f'<span>p.{s["page"]}</span>{s["title"][:55]}{"…" if len(s["title"]) > 55 else ""}'
+                            f'</div>'
+                        )
+                    pills_html += "</div>"
+                    st.markdown(pills_html, unsafe_allow_html=True)
 
-            st.markdown(answer, unsafe_allow_html=True)
-
-            # Source pills
-            if sources:
-                pills_html = '<div class="source-container"><div class="source-label">Sources</div>'
-                for s in sources:
-                    pills_html += (
-                        f'<div class="source-pill">'
-                        f'<span>p.{s["page"]}</span>{s["title"][:55]}{"…" if len(s["title"]) > 55 else ""}'
-                        f'</div>'
-                    )
-                pills_html += "</div>"
-                st.markdown(pills_html, unsafe_allow_html=True)
-
-    # Persist to history
-    source_md = ""
-    if sources:
-        source_md = "\n\n---\n**Sources:** " + " · ".join(
-            f'*{s["title"][:40]}…* p.{s["page"]}' for s in sources
+        # Persist to history
+        source_md = ""
+        if sources:
+            source_md = "\n\n---\n**Sources:** " + " · ".join(
+                f'*{s["title"][:40]}…* p.{s["page"]}' for s in sources
+            )
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer + source_md}
         )
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer + source_md}
-    )
