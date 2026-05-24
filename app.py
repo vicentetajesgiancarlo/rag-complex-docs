@@ -287,6 +287,25 @@ header    { visibility: hidden; height: 0; overflow: hidden; }
     background: #3d6ad6 !important;
 }
 
+/* Delete (✕) button — last column of every paper-card row in the sidebar */
+[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button {
+    background: transparent !important;
+    border: 1px solid #4d1a1a !important;
+    color: #f87171 !important;
+    padding: 2px 7px !important;
+    border-radius: 6px !important;
+    font-size: 0.78rem !important;
+    min-width: 28px !important;
+    line-height: 1.6 !important;
+    margin-top: 2px !important;
+    transition: all 0.2s;
+}
+[data-testid="stSidebar"] [data-testid="column"]:last-child .stButton > button:hover {
+    background: #2d1010 !important;
+    border-color: #f87171 !important;
+    color: #fca5a5 !important;
+}
+
 /* Success / error boxes */
 .upload-success {
     background: #0d2d1a;
@@ -346,6 +365,27 @@ def ingest_uploaded_pdf(pdf_path: Path, vs) -> int:
     vs.add_documents(chunks)
     return len(chunks)
 
+
+def delete_indexed_pdf(pdf_path: Path, vs) -> int:
+    """Remove all vector-store chunks for *pdf_path* and delete the physical file.
+
+    Queries ChromaDB for every chunk whose ``source`` metadata matches the
+    given path, deletes those IDs, then removes the file from disk.
+
+    Returns the number of chunk IDs removed from the vector store.
+    """
+    removed = 0
+    try:
+        result = vs.get(where={"source": str(pdf_path)}, include=[])
+        ids = result.get("ids", [])
+        if ids:
+            vs.delete(ids=ids)
+            removed = len(ids)
+    except Exception:
+        pass
+    pdf_path.unlink(missing_ok=True)
+    return removed
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -388,7 +428,21 @@ with st.sidebar:
             parts = name.split("_", 1)
             display_name = parts[1] if len(parts) > 1 else name
             safe_name = html.escape(display_name)
-            st.markdown(f'<div class="paper-card">{safe_name}</div>', unsafe_allow_html=True)
+            col_card, col_btn = st.columns([5, 1])
+            with col_card:
+                st.markdown(
+                    f'<div class="paper-card">{safe_name}</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_btn:
+                if st.button(
+                    "✕",
+                    key=f"delete_{pdf.name}",
+                    help=f"Remove '{display_name}' from the index",
+                ):
+                    with st.spinner(f"Removing {display_name}…"):
+                        delete_indexed_pdf(pdf, vector_store)
+                    st.rerun()
     else:
         st.markdown("""
             <div style="font-size:0.78rem; color:#4a6fa5; line-height:1.7;
