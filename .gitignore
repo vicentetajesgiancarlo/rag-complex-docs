@@ -121,6 +121,8 @@ ENV/
 env.bak/
 venv.bak/
 
-# Project specific
-data/raw_pdfs/
-data/vector_db/
+# Project specific — ignore data contents but keep the directory structure
+data/raw_pdfs/*
+!data/raw_pdfs/.gitkeep
+data/vector_db/*
+!data/vector_db/.gitkeep
