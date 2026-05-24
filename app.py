@@ -48,10 +48,10 @@ html, body, [class*="css"] {
     font-family: 'Inter', sans-serif;
 }
 
-/* Hide default Streamlit chrome */
-#MainMenu { visibility: hidden; }
-footer    { visibility: hidden; }
-header    { visibility: hidden; }
+/* Hide default Streamlit chrome and collapse their space entirely */
+#MainMenu { visibility: hidden; height: 0; overflow: hidden; }
+footer    { visibility: hidden; height: 0; overflow: hidden; }
+header    { visibility: hidden; height: 0; overflow: hidden; }
 
 /* ── Main background ── */
 .stApp {
@@ -199,21 +199,48 @@ header    { visibility: hidden; }
     color: #8b9ab5 !important;
 }
 
+/* ── Bottom sticky bar that wraps the chat input ── */
+[data-testid="stBottom"] {
+    background: #0f1117 !important;
+    border-top: 1px solid #1e2535;
+    padding: 0.6rem 1rem 0.6rem !important;
+}
+/* Kill the white inner wrapper div that Streamlit inserts inside stBottom */
+[data-testid="stBottom"] > div {
+    background: #0f1117 !important;
+}
+/* The chat-input component wrapper (gray by default) */
+[data-testid="stBottom"] > div > div {
+    background: #161b27 !important;
+    border-radius: 12px !important;
+    border: 1px solid #252d3d !important;
+}
+
 /* ── Chat input ── */
 [data-testid="stChatInput"] {
-    border-top: 1px solid #1e2535;
-    padding-top: 1rem;
+    padding-top: 0;
 }
 [data-testid="stChatInput"] textarea {
     background: #161b27 !important;
-    border: 1px solid #252d3d !important;
+    border: none !important;
     border-radius: 12px !important;
     color: #e2e8f0 !important;
     font-family: 'Inter', sans-serif !important;
+    outline: none !important;
 }
 [data-testid="stChatInput"] textarea:focus {
+    outline: none !important;
+    box-shadow: none !important;
+}
+/* Focused state: highlight the outer wrapper, not the textarea itself */
+[data-testid="stBottom"] > div > div:focus-within {
     border-color: #3d6ad6 !important;
     box-shadow: 0 0 0 2px rgba(61,106,214,0.15) !important;
+}
+
+/* ── Main content: bottom padding so messages aren't hidden behind sticky bar ── */
+[data-testid="stMainBlockContainer"] {
+    padding-bottom: 6rem !important;
 }
 
 /* Clear button */
