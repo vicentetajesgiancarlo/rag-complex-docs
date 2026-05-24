@@ -465,6 +465,9 @@ with st.sidebar:
                 <code style="color:#c9d1e0;">ollama serve</code>
             </div>
         """, unsafe_allow_html=True)
+        if st.button("↺ Reconnect LLM", key="reconnect_llm"):
+            init_rag.clear()
+            st.rerun()
     else:
         st.markdown("""
             <div style="font-size:0.78rem; color:#8b9ab5;">LLM backend is active and ready.</div>
