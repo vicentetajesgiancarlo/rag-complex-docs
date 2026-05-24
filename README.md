@@ -39,9 +39,11 @@ Generated Answer + Sources            [Document Chunks]
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Download papers and build the vector database
-python src/document_processor.py
-python src/embedding_utils.py
+# 2. (Optional) Download sample papers from arxiv and build the vector database
+python src/document_processor.py   # downloads papers to data/raw_pdfs/
+python src/embedding_utils.py      # embeds and indexes them into ChromaDB
+
+# You can also skip step 2 and upload PDFs directly via the web UI instead.
 
 # 3. Configure an LLM backend (choose one):
 
@@ -50,12 +52,14 @@ echo "OPENAI_API_KEY=sk-your-key-here" > .env
 
 # Option B: Ollama — install Ollama and pull a model
 ollama pull llama3
+ollama serve
+
+# The app also works in retrieval-only mode (no LLM) — it will display
+# the most relevant document chunks for any query.
 
 # 4. Run the Streamlit app
 streamlit run app.py
 ```
-
-The app also works in **retrieval-only mode** (no LLM) — it will display the most relevant document chunks for any query.
 
 ## Design Decisions
 
@@ -73,10 +77,10 @@ This model offers an excellent balance of embedding quality and speed for local 
 ```
 rag_complex_docs/
 ├── data/
-│   ├── raw_pdfs/          # Downloaded arxiv papers
+│   ├── raw_pdfs/          # Downloaded or user-uploaded PDFs
 │   └── vector_db/         # Persistent ChromaDB storage
 ├── src/
-│   ├── document_processor.py  # Download, parse, and chunk PDFs
+│   ├── document_processor.py  # arxiv download, PDF parsing, and chunking
 │   ├── embedding_utils.py     # Embedding model & vector DB creation
 │   └── rag_pipeline.py        # RAG chain (retriever + LLM)
 ├── app.py                 # Streamlit chat interface

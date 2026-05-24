@@ -117,7 +117,7 @@ This prevents hallucination, allows working with private/custom documents, and p
 rag_complex_docs/
 ├── data/
 │   ├── raw_pdfs/          # PDF files (downloaded or user-uploaded)
-│   └── vector_db/         # ChromaDB persistent storage (SQLite + parquet)
+│   └── vector_db/         # ChromaDB persistent storage (SQLite + binary HNSW index)
 ├── src/
 │   ├── document_processor.py   # arxiv download + PDF parsing + chunking
 │   ├── embedding_utils.py      # embedding model + vector DB creation/loading
@@ -137,8 +137,9 @@ Each file in `src/` is independently runnable as a script (via `if __name__ == "
 | Package | Version | Purpose |
 |---|---|---|
 | `langchain` | ≥0.3.0 | Core framework, orchestration |
-| `langchain-community` | ≥0.3.0 | `PyMuPDFLoader`, `Chroma`, `Ollama` integrations |
+| `langchain-community` | ≥0.3.0 | `PyMuPDFLoader`, `Chroma` integrations |
 | `langchain-huggingface` | ≥0.1.0 | `HuggingFaceEmbeddings` adapter |
+| `langchain-ollama` | ≥0.2.0 | `OllamaLLM` adapter (replaces deprecated community path) |
 | `langchain-openai` | ≥0.2.0 | `ChatOpenAI` adapter |
 | `langchain-text-splitters` | ≥0.3.0 | `RecursiveCharacterTextSplitter` |
 | `chromadb` | ≥0.5.0 | Local vector database |
@@ -178,15 +179,16 @@ def download_arxiv_papers(
 ```
 
 **What it does:**
-- Creates an `arxiv.Client()` and runs one `arxiv.Search` per query.
-- Sorts results by `SubmittedDate` to get the most recent papers.
+- Creates an `arxiv.Client()` and runs one `arxiv.Search` per query, sorted by `SubmittedDate`.
 - Uses a `seen_ids: set[str]` to deduplicate — if the same paper appears under two queries, it is only downloaded once.
-- Sanitizes the paper title to produce a filesystem-safe filename by stripping `/`, `\`, `:`, `?`, `"` and truncating to 80 characters.
+- Sanitizes the paper title to produce a filesystem-safe filename using `re.sub` to strip `\/:*?"<>|` and truncating to 80 characters.
 - Final filename format: `{arxiv_id}_{sanitized_title}.pdf`
 - Skips files that already exist on disk (idempotent — safe to re-run).
 - Returns a list of absolute file paths for all downloaded PDFs.
 
 **Error handling:** Each download is wrapped in `try/except`. A failure on one paper does not abort the rest.
+
+**Run standalone:** `python src/document_processor.py` downloads the configured papers and prints the paths. Intended as setup step 1 before `embedding_utils.py`.
 
 ---
 
@@ -246,17 +248,19 @@ def chunk_documents(
 
 ```python
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+EMBEDDING_DIM = 512          # output vector dimensions
 COLLECTION_NAME = "rag_academic_papers"
-VECTOR_DB_DIR = str(BASE_DIR / "data" / "vector_db")
+VECTOR_DB_DIR = BASE_DIR / "data" / "vector_db"   # Path object
 ```
 
 ### `get_embedding_model()`
 
 ```python
+@functools.lru_cache(maxsize=1)
 def get_embedding_model() -> HuggingFaceEmbeddings
 ```
 
-Initializes the BGE embedding model with:
+Initializes the BGE embedding model (cached singleton via `lru_cache` — loading happens only once per process):
 
 ```python
 HuggingFaceEmbeddings(
@@ -269,7 +273,7 @@ HuggingFaceEmbeddings(
 - `device="cpu"` — runs entirely on CPU, no GPU required.
 - `normalize_embeddings=True` — forces all output vectors to unit length (L2 norm = 1). When vectors are normalized, cosine similarity equals dot product, which is faster to compute and numerically more stable.
 
-The model produces **512-dimensional** dense vectors. On first call it downloads ~130MB of model weights from HuggingFace Hub into `~/.cache/huggingface/`.
+The model produces **512-dimensional** dense vectors (`EMBEDDING_DIM = 512`). On first call it downloads ~130MB of model weights from HuggingFace Hub into `~/.cache/huggingface/`.
 
 ---
 
@@ -278,7 +282,7 @@ The model produces **512-dimensional** dense vectors. On first call it downloads
 ```python
 def create_vector_db(
     chunks: list,
-    persist_directory: str = VECTOR_DB_DIR
+    persist_directory: Path = VECTOR_DB_DIR
 ) -> Chroma
 ```
 
@@ -295,7 +299,7 @@ The collection is named `"rag_academic_papers"`. ChromaDB uses this name to sepa
 ### `load_vector_db()`
 
 ```python
-def load_vector_db(persist_directory: str = VECTOR_DB_DIR) -> Chroma
+def load_vector_db(persist_directory: Path = VECTOR_DB_DIR) -> Chroma
 ```
 
 Loads an **existing** Chroma collection from disk without re-embedding anything. Used by `rag_pipeline.py` at startup.
@@ -311,19 +315,19 @@ This is the core of the RAG system. It connects the vector database (retrieval) 
 ### The Prompt Template
 
 ```python
-RAG_PROMPT = ChatPromptTemplate.from_template("""
-You are an expert academic research assistant. Use the following context
-from academic papers to answer the question. If you cannot find the answer
-in the context, say so clearly.
+RAG_PROMPT = ChatPromptTemplate.from_template(
+    """You are an expert research assistant. Use the following context \
+from the uploaded documents to answer the question. If you cannot find \
+the answer in the context, say so clearly.
 
 Context:
 {context}
 
 Question: {question}
 
-Provide a detailed, accurate answer based on the context above.
-Cite the source papers when possible.
-""")
+Provide a detailed, accurate answer based on the context above. \
+Cite the source documents when possible."""
+)
 ```
 
 **Two variables are injected at runtime:**
@@ -342,11 +346,11 @@ def get_llm()
 
 Priority-based LLM detection:
 
-1. **OpenAI** — checks `os.getenv("OPENAI_API_KEY")`. If set (via `.env` file), returns `ChatOpenAI(model="gpt-3.5-turbo", temperature=0.2)`.
+1. **OpenAI** — checks `os.getenv("OPENAI_API_KEY")` (populated by `load_dotenv()` from a `.env` file at the project root). If set, returns `ChatOpenAI(model="gpt-3.5-turbo", temperature=0.2)`.
 
-2. **Ollama** — makes a real HTTP GET to `http://localhost:11434/api/tags` with a 2-second timeout. Only if `status_code == 200` (Ollama is actually running) does it return `Ollama(model="llama3", temperature=0.2)`.
+2. **Ollama** — makes a real HTTP GET to `http://localhost:11434/api/tags` with a 2-second timeout. If status is 200, it also verifies that `llama3` appears in the list of pulled models. Only if both checks pass does it return `OllamaLLM(model="llama3", temperature=0.2)` (from `langchain_ollama`). If Ollama is running but `llama3` has not been pulled, a descriptive `LLMUnavailableError` is raised immediately rather than failing silently on the first query.
 
-3. **RuntimeError** — raised if neither backend is available. The app catches this and enters retrieval-only mode rather than crashing.
+3. **`LLMUnavailableError`** — a custom subclass of `RuntimeError` raised if neither backend is available. `init_rag()` in `app.py` catches specifically this exception and enters retrieval-only mode rather than crashing.
 
 **Why `temperature=0.2`:** Temperature controls the randomness of token sampling. At 0.0 the model is fully deterministic; at 1.0 it is highly creative. For a factual Q&A system over academic papers, 0.2 provides near-deterministic, accurate answers while allowing slight variation in phrasing.
 
@@ -402,12 +406,12 @@ def ask_question(query: str, chain=None, retriever=None) -> dict
 
 The public-facing function called by the Streamlit app. It:
 
-1. Calls `chain.invoke(query)` to get the generated answer string.
-2. Calls `retriever.invoke(query)` **a second time** to get the raw `Document` objects (the LCEL chain's internal retrieval doesn't expose them).
-3. Deduplicates sources by `"{filename}:p{page}"` key.
-4. Returns `{"answer": str, "sources": list[dict]}`.
-
-**Why two retriever calls?** The LCEL chain pipes retrieved docs directly into `_format_docs()`, discarding the `Document` objects. Calling the retriever again outside the chain is the clean way to get the metadata. Both calls hit the same in-memory Chroma index so performance impact is negligible.
+1. Wraps `chain` and `retriever` in a `RunnableParallel` and calls `.invoke(query)` **once**.
+   - The `answer` branch runs the full RAG chain (retrieval + LLM generation).
+   - The `source_docs` branch runs the retriever to capture the raw `Document` objects.
+   Both branches receive the exact same query string in the same call, guaranteeing that the sources displayed to the user always correspond to the context the LLM actually used.
+2. Deduplicates sources by `"{filename}:p{page}"` key.
+3. Returns `{"answer": str, "sources": list[dict]}`.
 
 ---
 
@@ -434,8 +438,8 @@ def init_rag():
     try:
         chain, retriever = build_rag_chain(vs)
         return vs, chain, retriever, True
-    except RuntimeError:
-        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    except LLMUnavailableError:
+        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": RETRIEVAL_K})
         return vs, None, retriever, False
 ```
 
@@ -448,15 +452,17 @@ The function returns the `vector_store` object itself so it can be mutated (new 
 ### `ingest_uploaded_pdf()`
 
 ```python
-def ingest_uploaded_pdf(pdf_path: Path) -> int:
+def ingest_uploaded_pdf(pdf_path: Path, vs) -> int:
     loader = PyMuPDFLoader(str(pdf_path))
     pages = loader.load()
     chunks = chunk_documents(pages)
-    vector_store.add_documents(chunks)
+    vs.add_documents(chunks)
     return len(chunks)
 ```
 
-`vector_store.add_documents()` is ChromaDB's incremental ingestion API. It:
+The `vs` parameter is the vector store instance returned by `init_rag()` and passed explicitly — no implicit global dependency.
+
+`vs.add_documents()` is ChromaDB's incremental ingestion API. It:
 1. Embeds each new chunk using the same `BAAI/bge-small-en-v1.5` model.
 2. Appends the new vectors to the existing collection.
 3. Writes the changes to disk immediately.
@@ -470,7 +476,7 @@ Because the `retriever` and `chain` hold a reference to the same `vector_store` 
 | Mode | Trigger | Behaviour |
 |---|---|---|
 | **Full RAG** | LLM backend detected | `ask_question()` → retrieval + LLM generation → answer + sources |
-| **Retrieval-only** | No LLM available | `retriever.invoke()` → 4 raw chunks shown as styled blockquotes |
+| **Retrieval-only** | No LLM available | `retriever.invoke()` → 4 raw chunks rendered as plain markdown |
 
 The app detects LLM availability once at startup (inside `init_rag`) and stores the boolean `llm_available`. Every render checks this flag to decide which mode to run.
 
@@ -496,8 +502,10 @@ This is the setup phase, run once before the app starts.
 ```
 python src/document_processor.py
     │
-    ├── arxiv.Client().results(search) × 4 queries
-    │       └── result.download_pdf() → data/raw_pdfs/{id}_{title}.pdf
+    └── arxiv.Client().results(search) × 4 queries
+            └── result.download_pdf() → data/raw_pdfs/{id}_{title}.pdf
+
+python src/embedding_utils.py
     │
     ├── PyMuPDFLoader(path).load()
     │       └── returns list[Document], one per page
@@ -506,7 +514,7 @@ python src/document_processor.py
     └── RecursiveCharacterTextSplitter(1000, 200).split_documents(pages)
             └── returns list[Document] (chunks), inheriting parent metadata
 
-python src/embedding_utils.py
+# (continued below)
     │
     ├── HuggingFaceEmbeddings("BAAI/bge-small-en-v1.5")
     │       └── downloads model to ~/.cache/huggingface/ (first run only)
@@ -527,29 +535,27 @@ This runs on every user message in the Streamlit app.
 user types: "What is the Poincaré inequality?"
     │
     ▼
-chain.invoke("What is the Poincaré inequality?")
+ask_question() wraps chain + retriever in RunnableParallel.invoke(query)
     │
-    ├── retriever branch:
-    │   ├── embed query → 512-dim vector
-    │   ├── ChromaDB cosine similarity search (k=4)
-    │   │   └── returns 4 Document objects (closest vectors)
-    │   └── _format_docs() → joined string of 4 chunk texts
+    ├── answer branch — chain.invoke(query):
+    │   │
+    │   ├── retriever sub-branch:
+    │   │   ├── embed query → 512-dim vector
+    │   │   ├── ChromaDB cosine similarity search (k=RETRIEVAL_K=4)
+    │   │   │   └── returns 4 Document objects (closest vectors)
+    │   │   └── _format_docs() → joined string of 4 chunk texts
+    │   │
+    │   ├── passthrough sub-branch:
+    │   │   └── "What is the Poincaré inequality?" (unchanged)
+    │   │
+    │   ├── RAG_PROMPT.format(context="...", question="...")
+    │   ├── OllamaLLM("llama3") OR ChatOpenAI("gpt-3.5-turbo")
+    │   └── StrOutputParser() → answer string
     │
-    └── passthrough branch:
-        └── "What is the Poincaré inequality?" (unchanged)
-    │
-    ▼
-RAG_PROMPT.format(context="...", question="...")
-    │
-    ▼
-ChatOpenAI("gpt-3.5-turbo") OR Ollama("llama3")
-    │
-    ▼
-StrOutputParser() → plain answer string
-    │
-    ▼
-retriever.invoke(query) [second call, for metadata only]
-    └── returns same 4 Documents → extract title + page
+    └── source_docs branch — retriever.invoke(query):
+        ├── embed query → 512-dim vector  (same query, parallel call)
+        ├── ChromaDB cosine similarity search (k=4)
+        └── returns 4 Document objects → title + page metadata extracted
     │
     ▼
 ask_question() returns:
@@ -562,7 +568,7 @@ ask_question() returns:
 }
     │
     ▼
-Streamlit renders answer text + source pill badges
+Streamlit renders answer as plain markdown + source pill badges
 ```
 
 ---
@@ -573,17 +579,17 @@ Streamlit renders answer text + source pill badges
 user drops PDF file onto the sidebar uploader
     │
     ▼
-uploaded_file.getvalue() → raw bytes
+uploaded_file.size > MAX_PDF_SIZE_BYTES (50 MB)? → reject with error message
     │
     ▼
 dest = RAW_PDFS_DIR / uploaded_file.name
 dest.exists()? → "Already indexed" warning (no duplicate processing)
     │
     ▼
-dest.write_bytes(raw_bytes)  ← saved to data/raw_pdfs/
+dest.write_bytes(uploaded_file.getvalue())  ← saved to data/raw_pdfs/
     │
     ▼
-ingest_uploaded_pdf(dest):
+ingest_uploaded_pdf(dest, vector_store):
     ├── PyMuPDFLoader(dest).load() → list[Document] (one per page)
     ├── chunk_documents(pages, 1000, 200) → list[Document] (chunks)
     └── vector_store.add_documents(chunks)
@@ -594,7 +600,7 @@ ingest_uploaded_pdf(dest):
     ▼
 st.rerun() → page refreshes
     ├── sidebar paper list re-reads data/raw_pdfs/ → new file appears
-    └── live_chunk_count re-queries vector_store._collection.count()
+    └── live_chunk_count re-queries len(vector_store.get(include=[])["ids"])
 ```
 
 The new document is immediately queryable — no restart needed.
@@ -666,7 +672,7 @@ LCEL components implement the `Runnable` interface with an `.invoke(input)` meth
 
 ### What is a Retriever?
 
-A retriever wraps a vector store and exposes `.invoke(query: str) -> list[Document]`. Internally it embeds the query and runs similarity search. The `search_kwargs={"k": 4}` tells it to return 4 results.
+A retriever wraps a vector store and exposes `.invoke(query: str) -> list[Document]`. Internally it embeds the query and runs similarity search. The `search_kwargs={"k": RETRIEVAL_K}` (default 4) tells it how many results to return.
 
 ---
 
@@ -915,7 +921,7 @@ Create `rag_complex_docs/.env`:
 OPENAI_API_KEY=sk-your-key-here
 ```
 
-The `python-dotenv` library loads this at startup via `load_dotenv()`. `ChatOpenAI` sends the filled prompt to OpenAI's API and returns the response. Costs approximately $0.001–0.002 per query with `gpt-3.5-turbo`.
+`rag_pipeline.py` calls `load_dotenv(dotenv_path=<project_root>/.env)` at import time, so the key is available before `get_llm()` is called. `ChatOpenAI` sends the filled prompt to OpenAI's API and returns the response. Costs approximately $0.001–0.002 per query with `gpt-3.5-turbo`.
 
 ### Option B: Ollama (local, free)
 
@@ -924,7 +930,7 @@ ollama pull llama3      # download the model (~4GB)
 ollama serve            # start the local API server on port 11434
 ```
 
-The pipeline checks `http://localhost:11434/api/tags` before attempting to use Ollama. This prevents a `ConnectionRefusedError` if Ollama isn't running.
+`get_llm()` checks `http://localhost:11434/api/tags` with a 2-second timeout. If Ollama is running, it then verifies that `llama3` appears in the response's model list. If the model hasn't been pulled, `LLMUnavailableError` is raised immediately with a message telling the user to run `ollama pull llama3`, rather than crashing silently on the first query.
 
 ### Adding a new LLM backend
 
@@ -1003,8 +1009,9 @@ This metadata is preserved through chunking and stored alongside each vector in 
 | arxiv download fails | Network error or rate limit | Per-paper `try/except`; other papers continue |
 | PDF parse error | Corrupt PDF or unsupported format | Per-file `try/except` in `load_pdfs()` |
 | `cmsOpenProfileFromMem failed` | Embedded ICC color profile in PDF | MuPDF warning only; text extraction still succeeds |
-| No LLM backend | OpenAI key missing and Ollama not running | `RuntimeError` caught in `init_rag()`; retrieval-only mode activated |
-| Ollama detected but not running | Process cached but crashed | HTTP ping to `:11434/api/tags` with 2s timeout before initializing |
+| No LLM backend | OpenAI key missing and Ollama not running | `LLMUnavailableError` caught in `init_rag()`; retrieval-only mode activated |
+| Ollama running but model not pulled | `llama3` not downloaded | `/api/tags` response is checked for `llama3` before returning the LLM; descriptive error shown at startup |
+| Ollama detected but crashed mid-session | Process died after startup | `try/except` around `ask_question()` in `app.py`; user sees error message instead of traceback |
 | Duplicate PDF upload | Same filename uploaded twice | `dest.exists()` check before writing; shows "Already indexed" message |
 | Upload ingestion fails | Corrupt PDF, disk full, etc. | `try/except` around `ingest_uploaded_pdf()`; uploaded file deleted on failure |
 | Windows unicode console error | `cp1252` codec can't encode math chars | `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` |
@@ -1035,7 +1042,7 @@ Embedding is the dominant cost. On CPU, `BAAI/bge-small-en-v1.5` processes rough
 | ChromaDB similarity search | < 0.05 seconds | HNSW index, O(log N) |
 | LLM generation (OpenAI) | 1–5 seconds | Network RTT + token generation |
 | LLM generation (Ollama/llama3) | 5–30 seconds | Depends on CPU/GPU speed |
-| Second retriever call (metadata) | < 0.05 seconds | Same index, cached |
+| Source doc extraction | < 0.05 seconds | Parallel with chain via RunnableParallel |
 
 Total perceived latency for a user is dominated entirely by the LLM. The retrieval step (vector search + embedding the query) is under 300ms on CPU.
 
@@ -1091,8 +1098,8 @@ All tuneable parameters and where they live:
 |---|---|---|
 | `SEARCH_QUERIES` | 4 topics | Topics queried on arxiv |
 | `MAX_RESULTS_PER_QUERY` | `2` | Papers downloaded per query |
-| `chunk_size` | `1000` | Max characters per chunk |
-| `chunk_overlap` | `200` | Shared characters between adjacent chunks |
+| `chunk_size` (in `chunk_documents`) | `1000` | Max characters per chunk |
+| `chunk_overlap` (in `chunk_documents`) | `200` | Shared characters between adjacent chunks |
 | `separators` | `["\n\n", "\n", ". ", " ", ""]` | Split priority order |
 
 ### embedding_utils.py
@@ -1100,6 +1107,7 @@ All tuneable parameters and where they live:
 | Constant | Default | Effect |
 |---|---|---|
 | `EMBEDDING_MODEL_NAME` | `"BAAI/bge-small-en-v1.5"` | HuggingFace model identifier |
+| `EMBEDDING_DIM` | `512` | Vector output dimensions (informational) |
 | `COLLECTION_NAME` | `"rag_academic_papers"` | ChromaDB collection name |
 | `VECTOR_DB_DIR` | `data/vector_db/` | ChromaDB persist path |
 | `device` | `"cpu"` | `"cuda"` for GPU acceleration |
@@ -1109,8 +1117,8 @@ All tuneable parameters and where they live:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `k` in `get_retriever()` | `4` | Number of chunks retrieved per query |
-| `search_type` | `"similarity"` | Can also be `"mmr"` (maximal marginal relevance) |
+| `RETRIEVAL_K` | `4` | Number of chunks retrieved per query |
+| `search_type` in `get_retriever()` | `"similarity"` | Can also be `"mmr"` (maximal marginal relevance) |
 | `temperature` | `0.2` | LLM output randomness (0 = deterministic, 1 = creative) |
 | LLM model (OpenAI) | `"gpt-3.5-turbo"` | Swap to `"gpt-4"` for higher quality |
 | LLM model (Ollama) | `"llama3"` | Any locally pulled model name |

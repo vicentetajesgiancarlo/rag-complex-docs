@@ -3,6 +3,7 @@ Streamlit Chat Interface for the RAG system.
 Run with: python -m streamlit run app.py
 """
 
+import html
 import sys
 from pathlib import Path
 
@@ -10,9 +11,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import streamlit as st
 from langchain_community.document_loaders import PyMuPDFLoader
-from rag_pipeline import build_rag_chain, load_vector_store, ask_question
-from embedding_utils import get_embedding_model
+from rag_pipeline import (
+    build_rag_chain,
+    load_vector_store,
+    ask_question,
+    RETRIEVAL_K,
+    LLMUnavailableError,
+)
+from embedding_utils import get_embedding_model, EMBEDDING_DIM
 from document_processor import chunk_documents
+
+MAX_PDF_SIZE_MB = 50
+MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -279,9 +289,7 @@ header    { visibility: hidden; }
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Compute corpus stats once (used in both sidebar and hero)
 RAW_PDFS_DIR = Path(__file__).resolve().parent / "data" / "raw_pdfs"
-pdf_files = sorted(RAW_PDFS_DIR.glob("*.pdf")) if RAW_PDFS_DIR.exists() else []
 
 # ---------------------------------------------------------------------------
 # Init RAG (cached)
@@ -293,22 +301,22 @@ def init_rag():
     try:
         chain, retriever = build_rag_chain(vs)
         return vs, chain, retriever, True
-    except RuntimeError:
-        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    except LLMUnavailableError:
+        retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": RETRIEVAL_K})
         return vs, None, retriever, False
 
 vector_store, chain, retriever, llm_available = init_rag()
 
 
-def ingest_uploaded_pdf(pdf_path: Path) -> int:
-    """Parse, chunk, and add a new PDF to the existing vector store.
+def ingest_uploaded_pdf(pdf_path: Path, vs) -> int:
+    """Parse, chunk, and add a new PDF to the given vector store.
 
     Returns the number of chunks added.
     """
     loader = PyMuPDFLoader(str(pdf_path))
     pages = loader.load()
     chunks = chunk_documents(pages)
-    vector_store.add_documents(chunks)
+    vs.add_documents(chunks)
     return len(chunks)
 
 # ---------------------------------------------------------------------------
@@ -319,7 +327,7 @@ def ingest_uploaded_pdf(pdf_path: Path) -> int:
 pdf_files = sorted(RAW_PDFS_DIR.glob("*.pdf")) if RAW_PDFS_DIR.exists() else []
 live_pdf_count = len(pdf_files)
 try:
-    live_chunk_count = vector_store._collection.count()
+    live_chunk_count = len(vector_store.get(include=[])["ids"])
 except Exception:
     live_chunk_count = "?"
 
@@ -352,7 +360,8 @@ with st.sidebar:
             name = pdf.stem
             parts = name.split("_", 1)
             display_name = parts[1] if len(parts) > 1 else name
-            st.markdown(f'<div class="paper-card">{display_name}</div>', unsafe_allow_html=True)
+            safe_name = html.escape(display_name)
+            st.markdown(f'<div class="paper-card">{safe_name}</div>', unsafe_allow_html=True)
     else:
         st.markdown("""
             <div style="font-size:0.78rem; color:#4a6fa5; line-height:1.7;
@@ -367,15 +376,17 @@ with st.sidebar:
     if not llm_available:
         st.markdown("""
             <div style="font-size:0.78rem; color:#8b9ab5; line-height:1.7;">
-                Ollama is not running.<br>
-                Start it with:<br>
+                No LLM backend found.<br>
+                Options:<br>
+                <code style="color:#c9d1e0;">OPENAI_API_KEY=sk-... in .env</code><br>
+                or:<br>
                 <code style="color:#c9d1e0;">ollama pull llama3</code><br>
                 <code style="color:#c9d1e0;">ollama serve</code>
             </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
-            <div style="font-size:0.78rem; color:#8b9ab5;">Ollama (llama3) is active and ready.</div>
+            <div style="font-size:0.78rem; color:#8b9ab5;">LLM backend is active and ready.</div>
         """, unsafe_allow_html=True)
 
     # PDF Upload
@@ -386,31 +397,38 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     if uploaded_file is not None:
-        dest = RAW_PDFS_DIR / uploaded_file.name
-        if dest.exists():
+        if uploaded_file.size > MAX_PDF_SIZE_BYTES:
             st.markdown(
-                '<div class="upload-success">Already indexed: this PDF is in the corpus.</div>',
+                f'<div class="upload-error">File too large. Maximum allowed size is {MAX_PDF_SIZE_MB} MB.</div>',
                 unsafe_allow_html=True,
             )
         else:
-            with st.spinner("Parsing & indexing..."):
-                try:
-                    RAW_PDFS_DIR.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(uploaded_file.getvalue())
-                    n_chunks = ingest_uploaded_pdf(dest)
-                    st.markdown(
-                        f'<div class="upload-success">'
-                        f'Indexed <b>{uploaded_file.name}</b> &mdash; {n_chunks} chunks added.'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                    st.rerun()
-                except Exception as e:
-                    dest.unlink(missing_ok=True)
-                    st.markdown(
-                        f'<div class="upload-error">Failed: {e}</div>',
-                        unsafe_allow_html=True,
-                    )
+            dest = RAW_PDFS_DIR / uploaded_file.name
+            if dest.exists():
+                st.markdown(
+                    '<div class="upload-success">Already indexed: this PDF is in the corpus.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                with st.spinner("Parsing & indexing..."):
+                    try:
+                        RAW_PDFS_DIR.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(uploaded_file.getvalue())
+                        n_chunks = ingest_uploaded_pdf(dest, vector_store)
+                        safe_fname = html.escape(uploaded_file.name)
+                        st.markdown(
+                            f'<div class="upload-success">'
+                            f'Indexed <b>{safe_fname}</b> &mdash; {n_chunks} chunks added.'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        dest.unlink(missing_ok=True)
+                        st.markdown(
+                            f'<div class="upload-error">Failed: {html.escape(str(e))}</div>',
+                            unsafe_allow_html=True,
+                        )
 
     # Stats
     st.markdown('<div class="sidebar-section-title">Corpus Stats</div>', unsafe_allow_html=True)
@@ -487,20 +505,20 @@ else:
                     <div class="stat-label">Chunks</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-value">512d</div>
+                    <div class="stat-value">{EMBEDDING_DIM}d</div>
                     <div class="stat-label">Embeddings</div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-value">top&#8209;4</div>
+                    <div class="stat-value">top&#8209;{RETRIEVAL_K}</div>
                     <div class="stat-label">Retrieved</div>
                 </div>
             </div>
         """, unsafe_allow_html=True)
 
-    # Chat history
+    # Chat history — rendered as plain markdown (no raw HTML from stored content)
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"], unsafe_allow_html=True)
+            st.markdown(msg["content"])
 
     # Chat input & response
     if prompt := st.chat_input("Ask a question about your documents..."):
@@ -513,51 +531,54 @@ else:
                 sources = []
 
                 if llm_available and chain is not None:
-                    result = ask_question(prompt, chain=chain, retriever=retriever)
-                    answer = result["answer"]
-                    sources = result["sources"]
+                    try:
+                        result = ask_question(prompt, chain=chain, retriever=retriever)
+                        answer = result["answer"]
+                        sources = result["sources"]
+                    except Exception as e:
+                        answer = (
+                            f"An error occurred while generating the answer: {e}\n\n"
+                            "The LLM may have become unavailable. Try restarting the app."
+                        )
                 else:
                     docs = retriever.invoke(prompt)
-                    answer_parts = [
-                        '<div style="font-size:0.8rem; color:#4a6fa5; '
-                        'text-transform:uppercase; letter-spacing:0.08em; '
-                        'margin-bottom:0.8rem;">Retrieved Context (no LLM)</div>'
-                    ]
-                    seen = set()
+                    answer_parts = ["**Retrieved Context** *(no LLM available)*\n"]
+                    seen: set[str] = set()
                     for i, doc in enumerate(docs, 1):
                         meta = doc.metadata
                         source_file = Path(meta.get("source", "unknown")).name
                         page = meta.get("page", "?")
                         title = meta.get("title", source_file)
                         answer_parts.append(
-                            f'<div style="background:#161b27; border:1px solid #1e2535; '
-                            f'border-radius:8px; padding:10px 14px; margin-bottom:8px; '
-                            f'font-size:0.83rem; color:#c9d1e0; line-height:1.6;">'
-                            f'<div style="font-size:0.7rem; color:#4a6fa5; margin-bottom:4px;">'
-                            f'{title} — p.{page}</div>'
-                            f'{doc.page_content[:400]}…</div>'
+                            f"**{title}** — p.{page}\n\n"
+                            f"{doc.page_content[:400]}…\n"
                         )
                         key = f"{source_file}:p{page}"
                         if key not in seen:
                             seen.add(key)
                             sources.append({"title": title, "page": page, "file": source_file})
-                    answer = "\n".join(answer_parts)
+                    answer = "\n---\n".join(answer_parts)
 
-                st.markdown(answer, unsafe_allow_html=True)
+                # Render answer as plain markdown — no unsafe HTML from LLM output
+                st.markdown(answer)
 
-                # Source pills
+                # Source pills — metadata values are HTML-escaped before injection
                 if sources:
                     pills_html = '<div class="source-container"><div class="source-label">Sources</div>'
                     for s in sources:
+                        truncated = s["title"][:55]
+                        ellipsis = "…" if len(s["title"]) > 55 else ""
+                        safe_title = html.escape(truncated) + ellipsis
+                        safe_page = html.escape(str(s["page"]))
                         pills_html += (
                             f'<div class="source-pill">'
-                            f'<span>p.{s["page"]}</span>{s["title"][:55]}{"…" if len(s["title"]) > 55 else ""}'
+                            f'<span>p.{safe_page}</span>{safe_title}'
                             f'</div>'
                         )
                     pills_html += "</div>"
                     st.markdown(pills_html, unsafe_allow_html=True)
 
-        # Persist to history
+        # Persist to history as plain markdown
         source_md = ""
         if sources:
             source_md = "\n\n---\n**Sources:** " + " · ".join(
